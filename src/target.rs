@@ -11,8 +11,6 @@
 const PHONE_SERVER: &str = "s.whatsapp.net";
 
 /// Hosts that keep a phone number in the last segment of their path.
-const NUMBER_HOSTS: [&str; 4] = ["wa.me", "www.wa.me", "api.whatsapp.com", "web.whatsapp.com"];
-
 /// Fewest digits a number may have. E.164 allows up to fifteen; the lower
 /// bound keeps a year, a short code, or a stray digit out of a chat.
 const MIN_DIGITS: usize = 6;
@@ -32,7 +30,7 @@ pub struct Request {
 impl Request {
     /// The name this chat shows until the contact is known.
     pub fn display_name(&self) -> String {
-        crate::util::phone(&number_in(&self.chat).unwrap_or_default())
+        crate::util::phone(&number_of_jid(&self.chat).unwrap_or_default())
     }
 
     /// The single-instance verb another launch sends this as.
@@ -57,9 +55,7 @@ impl Request {
             Some((chat, text)) => (chat, Some(decode(text))),
             None => (verb, None),
         };
-        if number_in(chat).is_none_or(|number| !is_a_number(&number)) {
-            return None;
-        }
+        number_of_jid(chat)?;
         Some(Self {
             chat: chat.to_owned(),
             text: text.filter(|text| !text.trim().is_empty()),
@@ -80,59 +76,87 @@ pub fn parse(target: &str) -> Option<Request> {
     if trimmed.is_empty() {
         return None;
     }
-    let query = trimmed
-        .split_once('?')
-        .map(|(_, query)| query)
-        .unwrap_or("");
-    let number = match parameter(query, "phone") {
-        Some(phone) => Some(digits(&decode(phone))),
-        None => path_number(trimmed).or_else(|| bare_number(trimmed)),
-    }?;
-    if !is_a_number(&number) {
-        return None;
-    }
+    let (_, query) = split_query(trimmed);
     Some(Request {
-        chat: format!("{number}@{PHONE_SERVER}"),
+        chat: format!("{}@{PHONE_SERVER}", number_of(trimmed)?),
         text: parameter(query, "text")
             .map(decode)
             .filter(|text| !text.trim().is_empty()),
     })
 }
 
-/// The number in the last segment of the path, for the links that keep it
-/// there.
-fn path_number(target: &str) -> Option<String> {
+/// The number `target` names, read where its own shape keeps it.
+///
+/// The shape decides where to look: a `wa.me` link keeps its number in the
+/// path, the web send link and the `whatsapp:` URI keep it in the query, and a
+/// number on its own is the whole argument. A link of any other shape names no
+/// chat, however its query is spelled.
+fn number_of(target: &str) -> Option<String> {
+    let (head, query) = split_query(target);
+    let lower = head.to_ascii_lowercase();
+    if lower.starts_with("whatsapp:") || lower.starts_with("whatsapp-send:") {
+        return parameter(query, "phone").and_then(number_in);
+    }
+    if let Some((host, path)) = http_host_path(head) {
+        return match host.to_ascii_lowercase().as_str() {
+            "wa.me" | "www.wa.me" => last_segment(path)
+                .and_then(number_in)
+                .or_else(|| parameter(query, "phone").and_then(number_in)),
+            "api.whatsapp.com" | "web.whatsapp.com" => {
+                parameter(query, "phone").and_then(number_in)
+            }
+            _ => None,
+        };
+    }
+    // A number on its own, or a `wa.me` link typed without its scheme.
+    let bare = match lower.strip_prefix("wa.me/") {
+        Some(_) => &head["wa.me/".len()..],
+        None => head,
+    };
+    number_in(bare)
+}
+
+/// Splits a target at its query, so a query never lends its digits to a
+/// number that lives in the path.
+fn split_query(target: &str) -> (&str, &str) {
+    match target.split_once('?') {
+        Some((head, query)) => (head, query),
+        None => (target, ""),
+    }
+}
+
+/// The host and path of an `http(s)` link, the scheme off.
+fn http_host_path(target: &str) -> Option<(&str, &str)> {
     let rest = target
         .strip_prefix("https://")
         .or_else(|| target.strip_prefix("http://"))?;
-    let (host, path) = rest.split_once('/')?;
-    if !NUMBER_HOSTS
-        .iter()
-        .any(|known| host.eq_ignore_ascii_case(known))
-    {
-        return None;
-    }
-    let last = path
-        .trim_end_matches('/')
-        .rsplit('/')
+    Some(rest.split_once('/').unwrap_or((rest, "")))
+}
+
+/// The last segment of a path, which is where a `wa.me` link keeps its number.
+fn last_segment(path: &str) -> Option<&str> {
+    let path = path.trim_end_matches('/');
+    path.rsplit('/')
         .next()
-        .unwrap_or(path);
-    Some(digits(&decode(last)))
+        .filter(|segment| !segment.is_empty())
 }
 
-/// The number a bare argument carries, in whatever formatting it was written
-/// in. A URL names no number outside a known host's path, so one is refused
-/// here rather than read out of a host nobody vouched for.
-fn bare_number(target: &str) -> Option<String> {
-    (!target.contains("://"))
-        .then(|| digits(target))
-        .filter(|number| !number.is_empty())
-}
-
-/// The digits in `text`, which is what every accepted shape reduces to once
-/// its host, path, and escapes are off.
-fn digits(text: &str) -> String {
-    text.chars().filter(char::is_ascii_digit).collect()
+/// The digits of the number written in `text`, when every other character is
+/// formatting a phone number may wear.
+///
+/// A letter, a slash, or anything else is refused rather than dropped, so
+/// `call 20123456789` names no chat instead of one nobody asked for.
+fn number_in(text: &str) -> Option<String> {
+    let text = decode(text);
+    let mut digits = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_ascii_digit() {
+            digits.push(character);
+        } else if !matches!(character, '+' | ' ' | '-' | '(' | ')' | '.') {
+            return None;
+        }
+    }
+    is_a_number(&digits).then_some(digits)
 }
 
 /// Whether `digits` can be a phone number's user part.
@@ -142,11 +166,10 @@ fn is_a_number(digits: &str) -> bool {
 
 /// The digits of the phone number `id` names, when `id` is one. A JID whose
 /// user part is not all digits, or whose server is another one, is not.
-fn number_in(id: &str) -> Option<String> {
+fn number_of_jid(id: &str) -> Option<String> {
     let (user, server) = id.split_once('@')?;
-    (server == PHONE_SERVER)
-        .then(|| digits(user))
-        .filter(|number| number.len() == user.len() && is_a_number(number))
+    (server == PHONE_SERVER && user.chars().all(|c| c.is_ascii_digit()) && is_a_number(user))
+        .then(|| user.to_owned())
 }
 
 /// One parameter of a query, still escaped.
@@ -269,8 +292,51 @@ mod tests {
             "https://example.com/20123456789",
             "https://example.com/wa.me/20123456789",
             "whatsapp://send?text=hello",
+            // A `phone=` on a host nobody vouched for names no chat.
+            "https://example.com/?phone=20123456789",
+            "https://evil.test/send?phone=20123456789",
+            // Nor does a bare argument that spells one.
+            "phone=20123456789",
         ] {
             assert_eq!(parse(target), None, "{target}");
+        }
+    }
+
+    /// A letter is not formatting a number may wear, so text that merely
+    /// contains digits names no chat.
+    #[test]
+    fn digits_among_words_are_not_a_number() {
+        for target in [
+            "call 20123456789",
+            "20123456789 please",
+            "https://wa.me/abc20123456789",
+            "wa.me/20123456789abc",
+        ] {
+            assert_eq!(parse(target), None, "{target}");
+        }
+    }
+
+    /// The shape decides where the number is. A `wa.me` link keeps it in the
+    /// path, so a query cannot lend it digits, and a path number wins over a
+    /// `phone=` that disagrees with it.
+    #[test]
+    fn a_query_never_lends_its_digits_to_the_number() {
+        // The path has no number, and the query's must not become one.
+        assert_eq!(parse("https://wa.me/?text=20123456789"), None);
+        assert_eq!(parse("https://wa.me/2012?text=999999"), None);
+        // The path number is the chat, whatever the query says.
+        assert_eq!(
+            chat_of_argument("https://wa.me/20123456789?phone=999999999"),
+            CHAT
+        );
+    }
+
+    /// A number on its own may be written with the formatting a phone number
+    /// wears, and nothing else.
+    #[test]
+    fn a_bare_number_takes_formatting_but_not_words() {
+        for target in ["+20 (123) 456-789", "+20-123-456-789", "+20.123.456.789"] {
+            assert_eq!(chat_of_argument(target), CHAT, "{target}");
         }
     }
 

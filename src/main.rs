@@ -272,15 +272,15 @@ fn run() -> eframe::Result<()> {
     }
     // The first launch owns the slot, so no verb reached a running copy and
     // the chat is opened here. The app drains its queue after the frame.
-    if let Some(request) = target {
+    if let Some(request) = &target {
         app.actions.push(zapfast::model::Action::StartChat {
             name: request.display_name(),
             id: request.chat.clone(),
         });
-        if let Some(text) = request.text {
+        if let Some(text) = &request.text {
             app.actions.push(zapfast::model::Action::PrefillComposer {
                 chat: request.chat.clone(),
-                text,
+                text: text.clone(),
             });
         }
     }
@@ -307,7 +307,14 @@ fn run() -> eframe::Result<()> {
     // The link, archive, and tray outlive windows. The shell recreates a
     // window when the tray, a notification, or another launch requests one;
     // without a tray a hidden start shows the window (App::start_hidden).
-    let start_hidden = cli.start_hidden && !demo && update_receipt.is_none();
+    // A link asked to be seen, so it overrides a hidden start: the chat it
+    // named would otherwise open behind a tray nobody is looking at.
+    let start_hidden = start_hidden(
+        cli.start_hidden,
+        target.is_some(),
+        demo,
+        update_receipt.is_some(),
+    );
     fastframe_shell::Shell::new(app, &waker)
         .start_hidden(start_hidden)
         .idle(fastframe_tray::idle)
@@ -436,6 +443,15 @@ fn redact_protocol(
     (is_protocol_target(record.target())
         || is_protocol_target(record.module_path().unwrap_or_default()))
     .then(|| protocol_summary(message))
+}
+
+/// Whether the first window starts in the tray.
+///
+/// A link overrides a hidden start: the chat it named would otherwise open
+/// behind a tray nobody is looking at. A demo and an update receipt have
+/// their own reasons to keep it hidden.
+fn start_hidden(requested: bool, has_target: bool, demo: bool, receipt: bool) -> bool {
+    requested && !has_target && !demo && !receipt
 }
 
 /// Parses `--demo-size WxH`.
@@ -743,6 +759,26 @@ mod target_cli_tests {
         let cli = Cli::try_parse_from(["zapfast", "--start-hidden"]).unwrap();
         assert!(cli.start_hidden);
         assert!(cli.target.is_none());
+    }
+
+    /// A link asked to be seen: `--start-hidden` with a chat to open must not
+    /// leave the chat behind a tray nobody is looking at.
+    #[test]
+    fn a_link_overrides_a_hidden_start() {
+        assert!(!start_hidden(true, true, false, false), "a link is shown");
+        assert!(
+            start_hidden(true, false, false, false),
+            "autostart stays hidden"
+        );
+        assert!(!start_hidden(false, false, false, false));
+        assert!(
+            !start_hidden(true, false, true, false),
+            "a demo is its own run"
+        );
+        assert!(
+            !start_hidden(true, false, false, true),
+            "an update is not seen"
+        );
     }
 }
 

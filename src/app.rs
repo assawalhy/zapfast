@@ -1179,10 +1179,23 @@ impl App {
         }
     }
 
+    /// Text a link put in the composer, and the reader never changed. It is
+    /// not their unsent text, so no path that saves the composer may keep it:
+    /// the draft they wrote stays theirs.
+    fn is_untouched_prefill(&self, chat: &str, text: &str) -> bool {
+        self.prefilled
+            .as_ref()
+            .is_some_and(|(prefilled_chat, prefilled)| prefilled_chat == chat && prefilled == text)
+    }
+
     fn park_composer(&mut self) {
         if let Some(previous) = self.open_chat.clone() {
             let draft = std::mem::take(&mut self.composer);
-            if self.editing.take().is_some() || draft.trim().is_empty() {
+            if self.is_untouched_prefill(&previous, &draft) {
+                // A link's text is not the reader's, so the draft they wrote
+                // stays exactly as it was.
+                self.composer_mentions.clear();
+            } else if self.editing.take().is_some() || draft.trim().is_empty() {
                 self.drafts.remove(&previous);
                 self.draft_mentions.remove(&previous);
                 self.composer_mentions.clear();
@@ -3243,6 +3256,7 @@ impl App {
         if self.open_chat.as_deref() == Some(id)
             && self.editing.is_none()
             && !self.composer.is_empty()
+            && !self.is_untouched_prefill(id, &self.composer)
         {
             let draft = std::mem::take(&mut self.composer);
             let mentions = std::mem::take(&mut self.composer_mentions);
@@ -3253,6 +3267,7 @@ impl App {
                 self.drafts.get(id).map(String::as_str).unwrap_or_default(),
             );
         }
+        self.prefilled = None;
         self.leave_chat(id);
     }
 
@@ -3563,10 +3578,7 @@ impl App {
                 // Text a link brought, and the reader never changed, is not
                 // their draft: the one they wrote stays theirs. An edit of it
                 // is theirs, and is kept as any other text is.
-                let untouched_prefill = self
-                    .prefilled
-                    .as_ref()
-                    .is_some_and(|(chat, text)| chat == &previous && text == &draft);
+                let untouched_prefill = self.is_untouched_prefill(&previous, &draft);
                 self.prefilled = None;
                 // Discard an unfinished edit instead of keeping it as a draft.
                 if self.editing.take().is_some() || draft.trim().is_empty() {
@@ -4180,6 +4192,7 @@ impl App {
                 if self.editing.is_none()
                     && self.composer.trim().is_empty()
                     && self.recording.is_none()
+                    && self.reply_to.is_none()
                     && !self.drafts.contains_key(&chat)
                 {
                     self.composer = text.clone();
@@ -4187,7 +4200,6 @@ impl App {
                     self.composer_mentions.clear();
                     self.emoji_start = None;
                     self.mention_start = None;
-                    self.reply_to = None;
                     self.focus_composer = true;
                 }
             }
@@ -4249,7 +4261,10 @@ impl App {
                 if let Some(chat) = self.open_chat.take() {
                     self.stop_composing(&chat);
                     let draft = std::mem::take(&mut self.composer);
-                    if self.editing.take().is_none() && !draft.trim().is_empty() {
+                    if self.is_untouched_prefill(&chat, &draft) {
+                        // A link's text is not the reader's; theirs stays.
+                        self.composer_mentions.clear();
+                    } else if self.editing.take().is_none() && !draft.trim().is_empty() {
                         self.drafts.insert(chat.clone(), draft);
                         let mentions = std::mem::take(&mut self.composer_mentions);
                         self.draft_mentions.insert(chat, mentions);
@@ -6502,6 +6517,7 @@ impl App {
     fn flush_open_draft(&self) {
         if let Some(chat) = self.open_chat.as_deref()
             && self.editing.is_none()
+            && !self.is_untouched_prefill(chat, &self.composer)
         {
             self.store_draft(chat, &self.composer);
         }
@@ -7169,6 +7185,111 @@ mod tests {
             "the template became a draft: {:?}",
             app.drafts.get(chat)
         );
+    }
+
+    /// Every path that saves the composer has to know a template is not the
+    /// reader's text, not only the one that switches chats.
+    #[test]
+    fn a_template_is_not_saved_by_any_other_path_either() {
+        for save in [
+            // Closing the chat.
+            "close", // Switching account parks the composer.
+            "park",  // Locking or shutting down flushes it.
+            "flush", // Hiding a locked chat stores it.
+            "hide",
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = app();
+            let chat = "peer@s.whatsapp.net";
+            app.chats.push(Chat::new(chat.into(), "Peer".into()));
+            app.apply(
+                Action::StartChat {
+                    id: chat.into(),
+                    name: "Peer".into(),
+                },
+                &ctx,
+            );
+            app.apply(
+                Action::PrefillComposer {
+                    chat: chat.into(),
+                    text: "Invoice 123".into(),
+                },
+                &ctx,
+            );
+
+            match save {
+                "close" => app.apply(Action::CloseChat, &ctx),
+                "park" => app.park_composer(),
+                "flush" => app.flush_open_draft(),
+                "hide" => app.hide_locked_chat(chat),
+                _ => unreachable!(),
+            }
+
+            assert_eq!(
+                app.drafts.get(chat),
+                None,
+                "the {save} path stored the template as a draft: {:?}",
+                app.drafts.get(chat)
+            );
+        }
+    }
+
+    /// The same paths must not delete a draft the reader did write, which is
+    /// the other half of the same rule.
+    #[test]
+    fn a_template_never_deletes_the_readers_draft() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "peer@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+        app.apply(
+            Action::StartChat {
+                id: chat.into(),
+                name: "Peer".into(),
+            },
+            &ctx,
+        );
+        // The reader's draft arrives while the chat is open, as it does when
+        // the archive answers after the window is up.
+        app.drafts.insert(chat.into(), "Half written".into());
+        app.composer = "Half written".into();
+
+        app.apply(Action::CloseChat, &ctx);
+
+        assert_eq!(
+            app.drafts.get(chat).map(String::as_str),
+            Some("Half written"),
+            "the reader's own draft survived"
+        );
+    }
+
+    /// A reply the reader armed is theirs to send: a template must not take
+    /// the composer and drop the quote with it.
+    #[test]
+    fn a_template_leaves_an_armed_reply_alone() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "peer@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+        app.apply(
+            Action::StartChat {
+                id: chat.into(),
+                name: "Peer".into(),
+            },
+            &ctx,
+        );
+        app.reply_to = Some("m1".into());
+
+        app.apply(
+            Action::PrefillComposer {
+                chat: chat.into(),
+                text: "Invoice 123".into(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(app.reply_to.as_deref(), Some("m1"), "the reply is kept");
+        assert!(app.composer.is_empty(), "and the composer is untouched");
     }
 
     /// An edit of a template is the reader's own text, and is kept the way
