@@ -32,6 +32,7 @@ pub mod settings;
 pub mod single_instance;
 pub mod sticker_meta;
 pub mod sticker_search;
+pub mod target;
 pub mod theme;
 pub mod timestretch;
 pub mod transcript;

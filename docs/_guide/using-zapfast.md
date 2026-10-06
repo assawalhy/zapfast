@@ -1,6 +1,6 @@
 ---
 title: Using ZapFast
-description: Send messages and use attachments, interactive messages, voice messages, and keyboard shortcuts.
+description: Send messages, open chats from links, and use attachments, interactive messages, voice messages, and keyboard shortcuts.
 redirect_from:
   - /using-fastsapp/
 nav_order: 3
@@ -302,6 +302,35 @@ Click the chat header to see its picture, number, and group members. When
 WhatsApp lets you edit a group's info, rename it with the pencil beside its
 name and click its photo to change it. Clicking a `chat.whatsapp.com` invite
 link shows the group and joins it without leaving ZapFast.
+
+## Links
+
+ZapFast registers the `whatsapp:` and `wa:` schemes, so a link that names a
+chat opens that chat here. This works from a terminal, a script, or anything
+else that hands a link to the desktop.
+
+```sh
+xdg-open 'whatsapp://send?phone=20123456789'
+xdg-open 'https://wa.me/20123456789?text=Invoice%20%23123%20is%20attached'
+zapfast +20123456789
+```
+
+A number on its own, a `wa.me` or `api.whatsapp.com` link, and the
+`whatsapp://send?phone=` URI all name the same chat. A `text=` template, which
+most shared links carry, lands in the composer without being sent, so you can
+edit it or add to it before sending. The composer keeps whatever you were
+already typing.
+
+When ZapFast is already running the link brings its window forward on that
+chat rather than starting a second copy, and when it is not it starts and
+opens the chat.
+
+A `https://wa.me/...` link opened in a browser still opens WhatsApp Web: the
+desktop decides what a web link means, and a browser cannot be told to hand
+one link to another app. Use the `whatsapp:` form, or `zapfast`, for that.
+
+An unreadable argument opens nothing and says so, rather than opening a chat
+it guessed at.
 
 ## Locked chats
 

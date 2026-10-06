@@ -1308,6 +1308,10 @@ pub enum Action {
         id: ChatId,
         name: String,
     },
+    /// Puts a template in the open chat's composer without sending it, the
+    /// way a share link's `text=` asks. Never overwrites what the reader is
+    /// already typing or editing.
+    PrefillComposer(String),
     /// Opens a chat at a message search result.
     OpenMessage {
         chat: ChatId,

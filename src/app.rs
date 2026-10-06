@@ -1468,6 +1468,18 @@ impl App {
                 ControlCommand::Show => self.actions.push(Action::ShowWindow),
                 ControlCommand::ReloadThemes => self.actions.push(Action::ReloadThemes),
                 ControlCommand::Ping => {}
+                ControlCommand::OpenChat(request) => {
+                    // The chat is only visible in a window, so a run
+                    // started into the tray shows one first.
+                    self.actions.push(Action::ShowWindow);
+                    self.actions.push(Action::StartChat {
+                        name: request.display_name(),
+                        id: request.chat.clone(),
+                    });
+                    if let Some(text) = request.text {
+                        self.actions.push(Action::PrefillComposer(text));
+                    }
+                }
             }
         }
     }
@@ -4114,6 +4126,22 @@ impl App {
                 }
                 self.open_chat(id);
                 self.dialog = None;
+            }
+            Action::PrefillComposer(text) => {
+                // The composer belongs to whoever is reading: a template is
+                // only a start, and only where nothing is already written.
+                if self.open_chat.is_some()
+                    && self.editing.is_none()
+                    && self.composer.trim().is_empty()
+                    && self.recording.is_none()
+                {
+                    self.composer = text;
+                    self.composer_mentions.clear();
+                    self.emoji_start = None;
+                    self.mention_start = None;
+                    self.reply_to = None;
+                    self.focus_composer = true;
+                }
             }
             Action::MessageYourself => {
                 if let Some(id) = self.me.clone() {
