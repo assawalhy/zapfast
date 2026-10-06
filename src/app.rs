@@ -538,6 +538,10 @@ pub struct App {
     unread_kept: HashSet<ChatId>,
     pub toasts: Vec<Toast>,
     pub actions: Vec<Action>,
+    /// Text a link put in the composer, with the chat it belongs to. Text the
+    /// reader never changed is not their draft, so a chat they leave does not
+    /// store it in place of the one they wrote.
+    prefilled: Option<(ChatId, String)>,
     /// Actions queued by a backend event, applied on that account after the frame.
     deferred_account_actions: Vec<(AccountId, Action)>,
     /// Set while the events of an account that is not on screen are being
@@ -1081,6 +1085,7 @@ impl App {
             unread_kept: HashSet::new(),
             toasts: Vec::new(),
             actions: Vec::new(),
+            prefilled: None,
             deferred_account_actions: Vec::new(),
             events_hidden: false,
             update: None,
@@ -1198,6 +1203,8 @@ impl App {
     }
 
     fn restore_composer(&mut self) {
+        // Whatever the composer held is not a link's text any more.
+        self.prefilled = None;
         if let Some(id) = self.open_chat.clone() {
             self.composer = self.drafts.remove(&id).unwrap_or_default();
             self.composer_mentions = self.draft_mentions.remove(&id).unwrap_or_default();
@@ -1477,7 +1484,10 @@ impl App {
                         id: request.chat.clone(),
                     });
                     if let Some(text) = request.text {
-                        self.actions.push(Action::PrefillComposer(text));
+                        self.actions.push(Action::PrefillComposer {
+                            chat: request.chat.clone(),
+                            text,
+                        });
                     }
                 }
             }
@@ -3550,12 +3560,20 @@ impl App {
             self.jump_highlight = None;
             if let Some(previous) = self.open_chat.take() {
                 let draft = std::mem::take(&mut self.composer);
+                // Text a link brought, and the reader never changed, is not
+                // their draft: the one they wrote stays theirs. An edit of it
+                // is theirs, and is kept as any other text is.
+                let untouched_prefill = self
+                    .prefilled
+                    .as_ref()
+                    .is_some_and(|(chat, text)| chat == &previous && text == &draft);
+                self.prefilled = None;
                 // Discard an unfinished edit instead of keeping it as a draft.
                 if self.editing.take().is_some() || draft.trim().is_empty() {
                     self.drafts.remove(&previous);
                     self.draft_mentions.remove(&previous);
                     self.composer_mentions.clear();
-                } else {
+                } else if !untouched_prefill {
                     self.drafts.insert(previous.clone(), draft);
                     let mentions = std::mem::take(&mut self.composer_mentions);
                     self.draft_mentions.insert(previous.clone(), mentions);
@@ -3574,6 +3592,7 @@ impl App {
                         placed: false,
                     });
             self.composer = self.drafts.remove(&id).unwrap_or_default();
+            self.prefilled = None;
             self.composer_mentions = self.draft_mentions.remove(&id).unwrap_or_default();
             // A search belongs to the chat it was typed in.
             self.close_chat_search();
@@ -4072,14 +4091,36 @@ impl App {
 
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
         if self.app_lock.is_locked() && !allowed_while_locked(&action) {
-            // A clicked notification opens its message once unlocked; the
-            // rest would show or change what the lock hides.
-            if let Action::OpenMessage { chat, message } = action {
-                self.app_lock.deferred = Some(crate::notify::NotificationTarget {
-                    account: self.account().id.clone(),
-                    chat,
-                    message,
-                });
+            // A clicked notification opens its message once unlocked, and a
+            // link opens the chat it named; the rest would show or change
+            // what the lock hides.
+            match action {
+                Action::OpenMessage { chat, message } => {
+                    self.app_lock.deferred = Some(crate::notify::NotificationTarget {
+                        account: self.account().id.clone(),
+                        chat,
+                        message,
+                    });
+                }
+                Action::StartChat { id, name: _ } => {
+                    // The name is the number, which the chat carries, so
+                    // nothing extra has to be kept for the replay.
+                    self.app_lock.deferred_request = Some(crate::target::Request {
+                        chat: id,
+                        text: None,
+                    });
+                }
+                Action::PrefillComposer { chat, text } => {
+                    // The chat it belongs to arrives in the request the
+                    // StartChat above is holding; a template without its
+                    // chat has nowhere to go.
+                    if let Some(request) = self.app_lock.deferred_request.as_mut()
+                        && request.chat == chat
+                    {
+                        request.text = Some(text);
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -4127,15 +4168,22 @@ impl App {
                 self.open_chat(id);
                 self.dialog = None;
             }
-            Action::PrefillComposer(text) => {
+            Action::PrefillComposer { chat, text } => {
                 // The composer belongs to whoever is reading: a template is
                 // only a start, and only where nothing is already written.
-                if self.open_chat.is_some()
-                    && self.editing.is_none()
+                if self.open_chat.as_deref() != Some(chat.as_str()) {
+                    // The chat was not opened. `open_chat` refuses a locked
+                    // chat outside its folder, and the reader is still in
+                    // another one: its text must not go there.
+                    return;
+                }
+                if self.editing.is_none()
                     && self.composer.trim().is_empty()
                     && self.recording.is_none()
+                    && !self.drafts.contains_key(&chat)
                 {
-                    self.composer = text;
+                    self.composer = text.clone();
+                    self.prefilled = Some((chat, text));
                     self.composer_mentions.clear();
                     self.emoji_start = None;
                     self.mention_start = None;
@@ -5880,12 +5928,27 @@ impl App {
                     return;
                 }
                 self.app_lock.unlocked(matched);
-                if matched && let Some(target) = self.app_lock.deferred.take() {
-                    self.switch_account(&target.account);
-                    self.actions.push(Action::OpenMessage {
-                        chat: target.chat,
-                        message: target.message,
-                    });
+                if matched {
+                    if let Some(target) = self.app_lock.deferred.take() {
+                        self.switch_account(&target.account);
+                        self.actions.push(Action::OpenMessage {
+                            chat: target.chat,
+                            message: target.message,
+                        });
+                    }
+                    if let Some(request) = self.app_lock.deferred_request.take() {
+                        self.actions.push(Action::ShowWindow);
+                        self.actions.push(Action::StartChat {
+                            name: request.display_name(),
+                            id: request.chat.clone(),
+                        });
+                        if let Some(text) = request.text {
+                            self.actions.push(Action::PrefillComposer {
+                                chat: request.chat,
+                                text,
+                            });
+                        }
+                    }
                 }
             }
             Outcome::WrongCurrent => {
@@ -5919,6 +5982,7 @@ impl App {
     fn forget_app_lock(&mut self) {
         self.app_lock.form = None;
         self.app_lock.deferred = None;
+        self.app_lock.deferred_request = None;
         self.app_lock.release();
         if self.settings.app_lock_hash.take().is_some() {
             self.save_settings();
@@ -7037,6 +7101,150 @@ mod tests {
         assert!(!app.scrolling.gliding(), "the glide stops");
         run(&mut app, time + 1.0, egui::Vec2::ZERO);
         assert_eq!(app.scroll_route.owner, None, "the next gesture picks");
+    }
+
+    /// The chat a link asked for can refuse to open: a locked chat outside
+    /// its folder stays shut, leaving the reader where they were. Its
+    /// template must not follow them there.
+    #[test]
+    fn a_template_does_not_land_in_another_chat() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let here = "here@s.whatsapp.net";
+        let locked = "locked@s.whatsapp.net";
+        app.chats.push(Chat::new(here.into(), "Here".into()));
+        let mut shut = Chat::new(locked.into(), "Shut".into());
+        shut.locked = true;
+        app.chats.push(shut);
+        app.open_chat = Some(here.into());
+
+        app.apply(
+            Action::PrefillComposer {
+                chat: locked.into(),
+                text: "This is not here".into(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(app.open_chat.as_deref(), Some(here));
+        assert!(
+            app.composer.is_empty(),
+            "the template stayed out of the open chat: {:?}",
+            app.composer
+        );
+    }
+
+    /// A link's template is a start, not something the reader left behind:
+    /// leaving the chat it filled must not store it as their draft.
+    #[test]
+    fn a_template_is_not_stored_as_a_draft() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "peer@s.whatsapp.net";
+        let other = "other@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+        app.chats.push(Chat::new(other.into(), "Other".into()));
+
+        app.apply(
+            Action::StartChat {
+                id: chat.into(),
+                name: "Peer".into(),
+            },
+            &ctx,
+        );
+        app.apply(
+            Action::PrefillComposer {
+                chat: chat.into(),
+                text: "Invoice 123 is attached".into(),
+            },
+            &ctx,
+        );
+        assert_eq!(app.composer, "Invoice 123 is attached");
+
+        app.apply(Action::OpenChat(other.into()), &ctx);
+
+        assert_eq!(
+            app.drafts.get(chat),
+            None,
+            "the template became a draft: {:?}",
+            app.drafts.get(chat)
+        );
+    }
+
+    /// An edit of a template is the reader's own text, and is kept the way
+    /// any other unsent text is.
+    #[test]
+    fn an_edited_template_is_kept_as_a_draft() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "peer@s.whatsapp.net";
+        let other = "other@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+        app.chats.push(Chat::new(other.into(), "Other".into()));
+
+        app.apply(
+            Action::StartChat {
+                id: chat.into(),
+                name: "Peer".into(),
+            },
+            &ctx,
+        );
+        app.apply(
+            Action::PrefillComposer {
+                chat: chat.into(),
+                text: "Invoice 123".into(),
+            },
+            &ctx,
+        );
+        app.composer = "Invoice 123, paid".into();
+
+        app.apply(Action::OpenChat(other.into()), &ctx);
+
+        assert_eq!(
+            app.drafts.get(chat).map(String::as_str),
+            Some("Invoice 123, paid")
+        );
+    }
+
+    /// Unsent text the reader wrote wins over a template: a link does not
+    /// replace what they were already going to send.
+    #[test]
+    fn a_template_leaves_the_readers_own_draft_alone() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "peer@s.whatsapp.net";
+        let other = "other@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+        app.chats.push(Chat::new(other.into(), "Other".into()));
+        app.drafts.insert(chat.into(), "Half written".into());
+
+        app.apply(
+            Action::StartChat {
+                id: chat.into(),
+                name: "Peer".into(),
+            },
+            &ctx,
+        );
+        app.apply(
+            Action::PrefillComposer {
+                chat: chat.into(),
+                text: "Invoice 123".into(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(app.composer, "Half written", "the draft is what is shown");
+
+        // Opening the chat took the draft into the composer, as it does for
+        // any chat. Leaving stores it back, and it is still the reader's.
+        app.apply(Action::OpenChat(other.into()), &ctx);
+        assert_eq!(
+            app.drafts.get(chat).map(String::as_str),
+            Some("Half written"),
+            "the template did not become the stored draft"
+        );
+        app.apply(Action::OpenChat(chat.into()), &ctx);
+        assert_eq!(app.composer, "Half written", "and it comes back");
     }
 
     /// A chat that is gone or emptied takes its confirmation with it: a modal
@@ -11697,6 +11905,102 @@ mod app_lock_tests {
         app.app_lock.entry = password.into();
         app.apply(Action::UnlockApp, ctx);
         finish(app, ctx);
+    }
+
+    /// A link names a chat the lock hides, and the reader asked for it from
+    /// outside, so it waits for the unlock rather than being dropped.
+    #[test]
+    fn a_link_waits_for_the_unlock() {
+        let ctx = egui::Context::default();
+        let mut app = app_with(settings(Some(PASSWORD)));
+        assert!(app.app_lock.is_locked());
+        app.chats = vec![Chat::new(CHAT.into(), "Ada Lovelace".into())];
+
+        app.apply(
+            Action::StartChat {
+                id: CHAT.into(),
+                name: "+1 555 000 0000".into(),
+            },
+            &ctx,
+        );
+        app.apply(
+            Action::PrefillComposer {
+                chat: CHAT.into(),
+                text: "Invoice 123 is attached".into(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(app.open_chat, None, "the lock hides the chat");
+        assert!(
+            app.composer.is_empty(),
+            "and hides the template: {:?}",
+            app.composer
+        );
+        assert_eq!(
+            app.app_lock.deferred_request,
+            Some(crate::target::Request {
+                chat: CHAT.into(),
+                text: Some("Invoice 123 is attached".into()),
+            }),
+            "the request is kept whole"
+        );
+
+        try_password(&mut app, &ctx, PASSWORD);
+
+        assert_eq!(
+            app.open_chat.as_deref(),
+            Some(CHAT),
+            "the unlock opens what the link asked for"
+        );
+        assert_eq!(app.composer, "Invoice 123 is attached");
+        assert_eq!(app.app_lock.deferred_request, None, "and forgets it");
+    }
+
+    /// Without a password there is nothing to wait for: the link opens.
+    #[test]
+    fn a_link_opens_at_once_when_no_lock_is_set() {
+        let ctx = egui::Context::default();
+        let mut app = unlocked_app();
+        app.chats = vec![Chat::new(CHAT.into(), "Ada Lovelace".into())];
+
+        app.apply(
+            Action::StartChat {
+                id: CHAT.into(),
+                name: "+1 555 000 0000".into(),
+            },
+            &ctx,
+        );
+        app.apply(
+            Action::PrefillComposer {
+                chat: CHAT.into(),
+                text: "Invoice 123 is attached".into(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(app.open_chat.as_deref(), Some(CHAT));
+        assert_eq!(app.composer, "Invoice 123 is attached");
+    }
+
+    /// Forgetting the lock forgets what was waiting on it: after unlinking
+    /// there is no chat left to open.
+    #[test]
+    fn forgetting_the_lock_forgets_a_waiting_link() {
+        let ctx = egui::Context::default();
+        let mut app = app_with(settings(Some(PASSWORD)));
+        app.apply(
+            Action::StartChat {
+                id: CHAT.into(),
+                name: "+1 555 0000".into(),
+            },
+            &ctx,
+        );
+        assert!(app.app_lock.deferred_request.is_some());
+
+        app.forget_app_lock();
+
+        assert_eq!(app.app_lock.deferred_request, None);
     }
 
     fn incoming(app: &mut App) -> Message {

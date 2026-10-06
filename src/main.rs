@@ -278,8 +278,10 @@ fn run() -> eframe::Result<()> {
             id: request.chat.clone(),
         });
         if let Some(text) = request.text {
-            app.actions
-                .push(zapfast::model::Action::PrefillComposer(text));
+            app.actions.push(zapfast::model::Action::PrefillComposer {
+                chat: request.chat.clone(),
+                text,
+            });
         }
     }
     #[cfg(feature = "demo")]

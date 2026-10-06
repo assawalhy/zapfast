@@ -311,7 +311,7 @@ else that hands a link to the desktop.
 
 ```sh
 xdg-open 'whatsapp://send?phone=20123456789'
-xdg-open 'https://wa.me/20123456789?text=Invoice%20%23123%20is%20attached'
+zapfast 'https://wa.me/20123456789?text=Invoice%20%23123%20is%20attached'
 zapfast +20123456789
 ```
 
@@ -319,11 +319,13 @@ A number on its own, a `wa.me` or `api.whatsapp.com` link, and the
 `whatsapp://send?phone=` URI all name the same chat. A `text=` template, which
 most shared links carry, lands in the composer without being sent, so you can
 edit it or add to it before sending. The composer keeps whatever you were
-already typing.
+already typing, and a chat with unsent text of your own keeps it: a template
+never replaces a draft you wrote.
 
 When ZapFast is already running the link brings its window forward on that
 chat rather than starting a second copy, and when it is not it starts and
-opens the chat.
+opens the chat. While the app lock is up the link waits for the unlock rather
+than opening anything the lock hides.
 
 A `https://wa.me/...` link opened in a browser still opens WhatsApp Web: the
 desktop decides what a web link means, and a browser cannot be told to hand
