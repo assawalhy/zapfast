@@ -118,7 +118,13 @@ fn number_of(target: &str) -> Option<String> {
 
 /// Splits a target at its query, so a query never lends its digits to a
 /// number that lives in the path.
+///
+/// A fragment is neither path nor query and is dropped first, so
+/// `wa.me/20123456789#section` names its chat and a `#` after a template does
+/// not reach the composer. A `#` inside a template is written `%23`, as a
+/// link must write it.
 fn split_query(target: &str) -> (&str, &str) {
+    let target = target.split('#').next().unwrap_or(target);
     match target.split_once('?') {
         Some((head, query)) => (head, query),
         None => (target, ""),
@@ -328,6 +334,23 @@ mod tests {
         assert_eq!(
             chat_of_argument("https://wa.me/20123456789?phone=999999999"),
             CHAT
+        );
+    }
+
+    /// A fragment is neither path nor query: it must not hide a number, and
+    /// it must not reach the composer. A `#` in a template is `%23`.
+    #[test]
+    fn a_fragment_is_not_part_of_the_number_or_the_template() {
+        assert_eq!(chat_of_argument("https://wa.me/20123456789#section"), CHAT);
+        assert_eq!(chat_of_argument("20123456789#section"), CHAT);
+        assert_eq!(
+            text_of("https://wa.me/20123456789?text=Hello#section"),
+            Some("Hello".to_owned())
+        );
+        assert_eq!(
+            text_of("whatsapp://send?phone=20123456789&text=a%23b"),
+            Some("a#b".to_owned()),
+            "an escaped hash is part of the template"
         );
     }
 
